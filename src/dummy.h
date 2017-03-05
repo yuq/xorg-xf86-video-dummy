@@ -42,6 +42,8 @@ typedef struct _color
     int blue;
 } dummy_colors;
 
+struct dumb_bo;
+
 typedef struct dummyRec 
 {
     DGAModePtr		DGAModes;
@@ -72,6 +74,11 @@ typedef struct dummyRec
     pointer* FBBase;
     Bool        (*CreateWindow)() ;     /* wrapped CreateWindow */
     Bool prop;
+
+    /* DRI support */
+    int fd;
+    CreateScreenResourcesProcPtr createScreenResources;
+    struct dumb_bo *front_bo;
 } DUMMYRec, *DUMMYPtr;
 
 /* The privates of the DUMMY driver */

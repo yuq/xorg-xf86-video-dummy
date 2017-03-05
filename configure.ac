@@ -68,6 +68,32 @@ AM_CONDITIONAL([DGA], [test "x$DGA" = xyes])
 # Obtain compiler/linker options for the driver dependencies
 PKG_CHECK_MODULES(XORG, [xorg-server >= 1.4.99.901] xproto fontsproto $REQUIRED_MODULES)
 
+# Check glamor support
+AC_ARG_ENABLE(glamor,
+	      AS_HELP_STRING([--disable-glamor],
+			     [Disable glamor, a new GL-based acceleration [default=enabled]]),
+	      [GLAMOR="$enableval"],
+	      [GLAMOR=yes])
+
+SAVE_CPPFLAGS="$CPPFLAGS"
+CPPFLAGS="$CPPFLAGS $XORG_CFLAGS"
+if test "x$GLAMOR" != "xno"; then
+	AC_CHECK_HEADERS([glamor.h], , [GLAMOR=no], [#include "xorg-server.h"])
+fi
+CPPFLAGS="$SAVE_CPPFLAGS"
+
+if test "x$GLAMOR" != "xno"; then
+	PKG_CHECK_MODULES(LIBDRM, [libdrm >= 2.4.25], , [GLAMOR=no])
+fi
+
+AC_MSG_CHECKING([whether to include GLAMOR support])
+AC_MSG_RESULT([$GLAMOR])
+
+if test "x$GLAMOR" != "xno"; then
+        AC_DEFINE(USE_GLAMOR, 1, [Enable glamor acceleration])
+fi
+AM_CONDITIONAL(GLAMOR, test x$GLAMOR != xno)
+
 # Checks for libraries.
 
 

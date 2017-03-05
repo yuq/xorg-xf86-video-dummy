@@ -49,6 +49,16 @@
 #include <X11/extensions/xf86dgaproto.h>
 #endif
 
+#ifdef USE_GLAMOR
+#define GLAMOR_FOR_XORG
+#include <glamor.h>
+#include <xf86drm.h>
+#include "dumb_bo.h"
+#endif
+
+#include <unistd.h>
+#include <fcntl.h>
+
 /* Mandatory functions */
 static const OptionInfoRec *	DUMMYAvailableOptions(int chipid, int busid);
 static void     DUMMYIdentify(int flags);
@@ -115,11 +125,13 @@ static SymTabRec DUMMYChipsets[] = {
 };
 
 typedef enum {
-    OPTION_SW_CURSOR
+    OPTION_SW_CURSOR,
+    OPTION_RENDER,
 } DUMMYOpts;
 
 static const OptionInfoRec DUMMYOptions[] = {
     { OPTION_SW_CURSOR,	"SWcursor",	OPTV_BOOLEAN,	{0}, FALSE },
+    { OPTION_RENDER,	"Render",	OPTV_STRING,	{0}, FALSE },
     { -1,                  NULL,           OPTV_NONE,	{0}, FALSE }
 };
 
@@ -189,15 +201,21 @@ DUMMYGetRec(ScrnInfoPtr pScrn)
 
     if (pScrn->driverPrivate == NULL)
 	return FALSE;
-        return TRUE;
+    return TRUE;
 }
 
 static void
 DUMMYFreeRec(ScrnInfoPtr pScrn)
 {
-    if (pScrn->driverPrivate == NULL)
+    DUMMYPtr dPtr = DUMMYPTR(pScrn);
+
+    if (!dPtr)
 	return;
-    free(pScrn->driverPrivate);
+
+    if (dPtr->fd >= 0)
+	close(dPtr->fd);
+
+    free(dPtr);
     pScrn->driverPrivate = NULL;
 }
 
@@ -266,10 +284,59 @@ DUMMYProbe(DriverPtr drv, int flags)
     return foundScreen;
 }
 
+static void
+try_enable_glamor(ScrnInfoPtr pScrn)
+{
+#ifdef USE_GLAMOR
+    Bool enabled = FALSE;
+    const char *render;
+    DUMMYPtr dPtr = DUMMYPTR(pScrn);
+    uint64_t value = 0;
+    int ret;
+
+    render = xf86GetOptValString(dPtr->Options, OPTION_RENDER);
+    if (!render)
+	return;
+
+    dPtr->fd = open(render, O_RDWR);
+    if (dPtr->fd < 0) {
+	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Open render %s fail\n", render);
+	return;
+    }
+
+    /* check for dumb capability */
+    ret = drmGetCap(dPtr->fd, DRM_CAP_DUMB_BUFFER, &value);
+    if (ret || !value) {
+	xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		   "KMS doesn't support dumb interface\n");
+	goto out;
+    }
+
+    if (xf86LoadSubModule(pScrn, GLAMOR_EGL_MODULE_NAME)) {
+        if (glamor_egl_init(pScrn, dPtr->fd)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO, "glamor initialized\n");
+	    enabled = TRUE;
+	} else {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "glamor initialization failed\n");
+	}
+    } else {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to load glamor module.\n");
+    }
+
+ out:
+    if (!enabled) {
+	close(dPtr->fd);
+	dPtr->fd = -1;
+    }
+#endif
+}
+
 # define RETURN \
     { DUMMYFreeRec(pScrn);\
-			    return FALSE;\
-					     }
+	return FALSE;\
+    }
 
 /* Mandatory */
 Bool
@@ -290,6 +357,7 @@ DUMMYPreInit(ScrnInfoPtr pScrn, int flags)
     }
     
     dPtr = DUMMYPTR(pScrn);
+    dPtr->fd = -1;
 
     pScrn->chipset = (char *)xf86TokenToString(DUMMYChipsets,
 					       DUMMY_CHIP);
@@ -450,6 +518,8 @@ DUMMYPreInit(ScrnInfoPtr pScrn, int flags)
     pScrn->memPhysBase = 0;
     pScrn->fbOffset = 0;
 
+    try_enable_glamor(pScrn);
+
     return TRUE;
 }
 #undef RETURN
@@ -500,6 +570,33 @@ DUMMYLoadPalette(
 
 }
 
+#ifdef USE_GLAMOR
+static Bool
+DUMMYCreateScreenResources(ScreenPtr pScreen)
+{
+    ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+    DUMMYPtr dPtr = DUMMYPTR(pScrn);
+    PixmapPtr pixmap;
+    Bool ret;
+    void *pixels = NULL;
+
+    pScreen->CreateScreenResources = dPtr->createScreenResources;
+    ret = pScreen->CreateScreenResources(pScreen);
+    pScreen->CreateScreenResources = DUMMYCreateScreenResources;
+
+    pixmap = pScreen->GetScreenPixmap(pScreen);
+    if (!glamor_egl_create_textured_pixmap(pixmap,
+					   dPtr->front_bo->handle,
+					   dPtr->front_bo->pitch)) {
+	xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		   "glamor_egl_create_textured_pixmap() failed\n");
+	return FALSE;
+    }
+
+    glamor_set_screen_pixmap(pixmap, NULL);
+}
+#endif
+
 static ScrnInfoPtr DUMMYScrn; /* static-globalize it */
 
 /* Mandatory */
@@ -519,9 +616,30 @@ DUMMYScreenInit(SCREEN_INIT_ARGS_DECL)
     dPtr = DUMMYPTR(pScrn);
     DUMMYScrn = pScrn;
 
+#ifdef USE_GLAMOR
+    if (dPtr->fd >= 0) {
+	xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		   "Screen %d %d %d.\n", pScrn->virtualX, pScrn->virtualY,
+					pScrn->bitsPerPixel);
+	dPtr->front_bo = dumb_bo_create(dPtr->fd, pScrn->virtualX, pScrn->virtualY,
+					pScrn->bitsPerPixel);
+	if (!dPtr->front_bo) {
+	    xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		       "Failed to create front buffer.\n");
+	    return FALSE;
+	}
 
-    if (!(dPtr->FBBase = malloc(pScrn->videoRam * 1024)))
-	return FALSE;
+	if (dumb_bo_map(dPtr->fd, dPtr->front_bo)) {
+	    xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		       "Failed to map front buffer.\n");
+	    return FALSE;
+	}
+
+	dPtr->FBBase = dPtr->front_bo->ptr;
+    } else
+#endif
+	if (!(dPtr->FBBase = malloc(pScrn->videoRam * 1024)))
+	    return FALSE;
 
     /*
      * Reset visual list.
@@ -565,6 +683,19 @@ DUMMYScreenInit(SCREEN_INIT_ARGS_DECL)
     
     /* must be after RGB ordering fixed */
     fbPictureInit(pScreen, 0, 0);
+
+#ifdef USE_GLAMOR
+    if (dPtr->fd >= 0) {
+        if (!glamor_init(pScreen, GLAMOR_USE_EGL_SCREEN)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to initialize glamor at ScreenInit() time.\n");
+            return FALSE;
+        }
+
+	dPtr->createScreenResources = pScreen->CreateScreenResources;
+	pScreen->CreateScreenResources = DUMMYCreateScreenResources;
+    }
+#endif
 
     xf86SetBlackWhitePixels(pScreen);
 
@@ -659,9 +790,15 @@ DUMMYCloseScreen(CLOSE_SCREEN_ARGS_DECL)
     ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
     DUMMYPtr dPtr = DUMMYPTR(pScrn);
 
-    if(pScrn->vtSema){
-	free(dPtr->FBBase);
-    }
+#ifdef USE_GLAMOR
+    if (dPtr->fd >= 0) {
+	dumb_bo_destroy(dPtr->fd, dPtr->front_bo);
+	dPtr->front_bo = NULL;
+    } else
+#endif
+	if(pScrn->vtSema) {
+	    free(dPtr->FBBase);
+	}
 
     if (dPtr->CursorInfo)
 	xf86DestroyCursorInfoRec(dPtr->CursorInfo);
