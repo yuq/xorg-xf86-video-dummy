@@ -165,6 +165,9 @@ DUMMY_OpenFramebuffer(
 ){
     DUMMYPtr pDUMMY = DUMMYPTR(pScrn);
 
+    if (pDUMMY->FBBase == NULL)
+	return FALSE;
+
     *name = NULL; 		/* no special device */
     *mem = (unsigned char*)pDUMMY->FBBase;
     *size = pScrn->videoRam * 1024;
